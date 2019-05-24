@@ -1,0 +1,1386 @@
+#!/bin/bash
+
+in_file="${1}"
+
+found=$(grep -c -E $'^ *(<|&lt;)query.*$' "${in_file}")
+
+if [ $found -eq 0 ]
+then
+	echo "Invalid export file"
+	exit 1
+fi
+
+free_type=$(grep -c -E $'^ *(<|&lt;)query.*FreeType="True".*$' "${in_file}")
+
+if [ $free_type -gt 0 ]
+then
+	echo "Free Type file, looking for SQL tag"
+	
+	sql=$(awk 'BEGIN{catch=0; sql=""}
+		 /^ *(<|&lt;)Sql(>|&gt;).*$/{catch=1}
+		 /^.*(<|&lt;)\/Sql(>|&gt;).*$/{sql = sql "\n" $0; exit}
+		 /^.*$/{
+				if(catch == 1)
+					sql = sql"\n"$0
+				}
+		 END{gsub(/(<|&lt;)Sql(>|&gt;)/,"",sql)
+			 gsub(/(<|&lt;)\/Sql(>|&gt;)/,"",sql)
+			 gsub(/&#xD;/,"",sql)
+			 gsub(/&amp;lt;/,"<",sql)
+			 gsub(/&amp;gt;/,">",sql)
+			 print sql}' "${in_file}")
+else
+	echo "DataBlock builder file, parsing table and field tags"
+	
+	sql=$(awk 'function strip_xml(str){
+			gsub(/(<|&lt;)[^>&]*(>|&gt;)/,"",str)
+			gsub(/(<|&lt;)\/[^>&]*(>|&gt;)/,"",str)
+			gsub(/&#xD;/,"",str)
+			gsub(/^[ \t]+/,"",str)
+			gsub(/[ \t]+$/,"",str)
+			return str
+		 }
+		 function strip_field(str){
+			gsub(/F*ield=/,"",str)
+			gsub(/"/,"",str)
+			gsub(/(&amp;#xA;|&#xA;)/,"\n\t",str)
+			gsub(/&amp;lt;/,"<",str)
+			gsub(/&amp;gt;/,">",str)
+			gsub(/(&gt;&#xD;)$/,"",str)
+			gsub(/&gt;$/,"",str)
+			gsub(/^[ \t]*/,"",str)
+			gsub(/[ \t]*$/,"",str)
+			return str
+		 }
+		 function strip_attr(str){
+			gsub(/ *(<|&lt;)join/,"",str)
+			gsub(/^[ \t]+/,"",str)
+			gsub(/[ \t]+$/,"",str)
+			return str
+		 }
+		 BEGIN{
+			table_id=0
+			old_table_id=0
+			where_id=0
+			column_id=0
+			catch_tab=0
+			catch_col=0
+			curr_tab=""
+			curr_col=""
+			order_id=0
+			query_id=0
+			skip_id=0
+			main_query_entered=0
+			main_union=0
+			main_sub_query_entered=0
+			union_entered=0
+			union_sub_query_entered=0
+			unions_exist=0
+			first_union_id=0
+			subs_exist=0
+			union_subs_exist=0
+			parent_query_id=0
+			last_query_id=0
+			grp_lvl=0
+			first_in_grp=0
+			grping=0
+			having_id=0
+			catch_have=0
+			group_id=0
+		 }
+		 /^ *(<|&lt;)\/Data(>|&gt;)[\n\r]*$/{exit}
+		 /^ *(<|&lt;)[Qq]uery.*(>|&gt;).*$/{
+			is_union=0
+			is_sub=0
+			if(main_query_entered == 0){
+				query_id = 1
+				last_query_id = 1
+				main_query_entered = 1
+			}else{
+				if(union_entered == 0){
+					if(main_sub_query_entered == 0){
+						main_sub_query_entered = 1
+						subs_exist = 1
+						is_sub = 1
+					}else{
+						main_sub_query_entered = 0
+					}
+					
+					# col_cnts[query_id] = column_id
+					# tab_cnts[query_id] = table_id
+					# where_cnts[query_id] = where_id
+					
+					# if(skip_id == 1){
+						# query_id = query_id + 2
+						# skip_id = 0
+					# }else{
+						# ++query_id
+					# }
+					
+					parent_query_id = query_id
+					query_id = last_query_id + 1
+					
+					old_table_id = table_id
+					column_id = 0
+					table_id = 0
+					where_id = 0
+				}else{
+					is_union = 1
+					
+					if(main_union == 0){
+						main_union = 1
+					}else{
+						union_sub_query_entered = 1
+						union_subs_exist = 1
+						is_sub = 1
+						
+						# col_cnts[query_id] = column_id
+						# tab_cnts[query_id] = table_id
+						# where_cnts[query_id] = where_id
+						
+						parent_query_id = query_id
+						query_id = last_query_id + 1
+						
+						old_table_id = table_id
+						column_id = 0
+						table_id = 0
+						where_id = 0
+					}
+				}
+			}
+			
+			query_types[query_id] = is_union is_sub
+			#print query_types[query_id]
+			
+			#printf "Query %d is type %s\n", query_id, is_union is_sub
+			
+			split($0,pts,/((<|&lt;)query|\") [ND]/)
+			
+			distinct[query_id] = 0
+			query_names[query_id] = "NULL"
+			
+			for(pt in pts){
+				if(pts[pt] ~ /D*istinct=\"Yes\"(>|&gt;)*/){
+					distinct[query_id] = 1
+				}
+				
+				if(pts[pt] ~ /N*ame=\"[^\"]*\"(>|&gt;)*/){
+					split(pts[pt],attVal,/=/)
+					val=attVal[2]
+					gsub(/\"/,"",val)
+					gsub(/&gt;&#xD;/,"",val)
+					gsub(/&gt;/,"",val)
+					query_names[query_id] = val
+					#print val
+				}
+			}
+		 }
+		 /^ *(<|&lt;)\/[Qq]uery(>|&gt;).*$/{
+			if(main_query_entered == 1){
+				if(main_sub_query_entered == 1){
+					main_sub_query_entered = 0
+					col_cnts[query_id] = column_id
+					tab_cnts[query_id] = table_id
+					where_cnts[query_id] = where_id
+					group_cnts[query_id] = group_id
+					having_cnts[query_id] = having_id
+					
+					last_query_id = query_id
+					query_id = parent_query_id
+					table_id = old_table_id
+					column_id = 0
+					where_id = 0
+					group_id = 0
+					having_id = 0
+					#skip_id=1
+				}
+					
+				if(union_entered == 1){
+					if(union_sub_query_entered == 1){
+						union_sub_query_entered = 0
+						col_cnts[query_id] = column_id
+						tab_cnts[query_id] = table_id
+						where_cnts[query_id] = where_id
+						group_cnts[query_id] = group_id
+						having_cnts[query_id] = having_id
+						
+						last_query_id = query_id
+						query_id = parent_query_id
+						table_id = old_table_id
+						column_id = 0
+						where_id = 0
+						group_id = 0
+						having_id = 0
+						#skip_id=1
+					}
+				}
+			}
+		 }
+		 /^ *(<|&lt;)[Uu]nion.*(>|&gt;).*$/{
+			union_entered = 1
+			col_cnts[query_id] = column_id
+			tab_cnts[query_id] = table_id
+			where_cnts[query_id] = where_id
+			
+			# if(skip_id == 1){
+				# query_id = query_id + 2
+				# skip_id = 0
+			# }else{
+				# ++query_id
+			# }
+			
+			query_id = last_query_id + 1
+			last_query_id = query_id
+			
+			column_id = 0
+			table_id = 0
+			where_id = 0
+			group_id = 0
+			having_id = 0
+			
+			if(unions_exist == 0){
+				unions_exist = 1
+				first_union_id = query_id
+			}
+			#print $0
+			split($0,pts,/((<|&lt;)[Uu]nion|\") /)
+
+			for(pt in pts){
+				if(pts[pt] ~ /UnionType=.*(>|&gt;)*/){
+					split(pts[pt],attVal,/=/)
+					val=attVal[2]
+					gsub(/\"/,"",val)
+					gsub(/&gt;(&#xD;)*/,"",val)
+					union_typ[query_id] = val
+				}
+			}
+		 }
+		 /^ *(<|&lt;)\/[Uu]nion.*(>|&gt;).*$/{union_entered = 0; main_union = 0}
+		 /^ *(<|&lt;)table(>|&gt;).*$/{catch_tab=1}
+		 /^ *(<|&lt;)\/table(>|&gt;).*$/{catch_tab=0; ++table_id; tables[query_id, table_id] = curr_tab; curr_tab = ""}
+		 /^ *(<|&lt;)Alias(>|&gt;).*$/{if(catch_tab == 1){curr_tab = strip_xml($0)}}
+		 /^ *(<|&lt;)Name(>|&gt;).*$/{if(catch_tab == 1){curr_tab = strip_xml($0)" "curr_tab}}
+		 /^ *(<|&lt;)visible_field.*(>|&gt;).*$/{
+			catch_col=1
+			start_catch=0
+			
+			for(z=1;z<=NF;z++){
+				if($z ~ /Field="[^"]*/){
+					start_catch = 1
+				}
+				if(start_catch == 1)
+					curr_col = curr_col" "$z
+			}
+
+			curr_col = strip_field(curr_col)
+		 }
+		 /^ *(<|&lt;)Summing(>|&gt;).*$/{
+			if(catch_col == 1){
+				type = $0
+				gsub(/(<|&lt;)\/*Summing(>|&gt;)/,"",type)
+				gsub(/&#xD;/,"",type)
+				
+				if(type ~ /[Gg]roup [Bb]y/){
+					++group_id
+					split(curr_col, pts, / as /)
+					group_col = pts[1]
+					groups[query_id, group_id] = group_col
+				}else{
+					if(curr_col ~ /.* as .*/){
+						split(curr_col, pts, / as /)
+						curr_col = toupper(type) "(" pts[1] ") as " pts[2]
+						gsub(/^[ \t]*/,"",curr_col)
+					}else{
+						curr_col = toupper(type) "(" curr_col ")"
+					}
+				}
+			}
+		 }
+		 /^ *(<|&lt;)[Hh]aving.*/{catch_have=1}
+		 /^ *(<|&lt;)\/[Hh]aving.*/{catch_have=0}
+		 /^ *(<|&lt;)\/visible_field(>|&gt;).*$/{catch_col=0; ++column_id; columns[query_id, column_id] = curr_col; curr_col = ""}
+		 /^ *(<|&lt;)ShortDescription(>|&gt;).*$/{if(catch_col == 1){curr_col = curr_col" as \""strip_xml($0)"\""}}
+		 /^ *(<|&lt;)DataType(>|&gt;).*$/{if(catch_col == 1){curr_col = curr_col "\t####" strip_xml($0)}}
+		 /^ *(<|&lt;)join.*(>|&gt;).*$/{
+			#print $0
+			lstr = ""
+			rjoin = "" 
+			rstr = ""
+			ljoin = ""
+			
+			split($0, xml, /(join|\") [TLR]/)
+			for(node in xml){
+				fullText = 0
+				attValPair = strip_attr(xml[node])
+				
+				#print "\t\t" attValPair
+				
+				#attr = attValPair
+				#val = attValPair
+				
+				#gsub(/\"[^\"]+/,"",attr)
+				#gsub(/=/,"",attr)
+				
+				#gsub(/[^\"]+=\"/,"",val)
+				
+				if(attValPair ~ /T*ext.*/){
+					val = attValPair
+					gsub(/T*ext=\"/,"",val)
+					where = val
+					fullText = 1
+					break
+				}
+				
+				if(attValPair ~ /T*ype.*/){
+					val = attValPair
+					gsub(/T*ype=\"/,"",val)
+					
+					if(val == "OuterLeft")
+						ljoin = " (+)"
+					
+					if(val == "OuterRight")
+						rjoin = " (+)"
+				}
+				
+				if(attValPair ~ /L*eftField.*/){
+					val = attValPair
+					gsub(/L*eftField=\"/,"",val)
+					lstr = val
+				}
+				
+				if(attValPair ~ /R*ightField.*/){
+					val = attValPair
+					#print "\t\t\t" val
+					gsub(/(R*ightField=\"|\"\/&gt(;&#xD;)*)/,"",val)
+					rstr = val
+				}
+			}
+			
+			if(fullText == 0)
+				where = lstr rjoin " = " rstr ljoin
+			
+			gsub(/^[\t ]*/,"",where)
+			
+			#print "\t" where
+			
+			++where_id
+			where_is_sub[query_id, where_id] = 0
+			wheres[query_id, where_id] = where
+			conds[query_id, where_id] = "AND"
+			where = ""
+		 }
+		 /^ *(<|&lt;)[Cc]onditional .*/{
+			if(catch_have == 1)
+				++having_id
+			else
+				++where_id
+				
+			# need better way to split attr val pairs
+			split($0,pts,/([Cc]onditional |\" [JTCF])/)
+			gsub(/&amp;gt;/,">",$0)
+			gsub(/&amp;lt;/,"<",$0)
+			
+			#print $0
+			
+			for(p in pts){
+				#print "\t\tPiece is " pts[p]
+				
+				if(pts[p] ~ /^J*oinType.*/){
+					split(pts[p],attVal,/=/)
+					val = toupper(strip_field(attVal[2]))
+					#print "Join type is " val
+					if(first_in_grp == 1){
+						val = ""
+						first_in_grp = 0
+					}
+					if(catch_have == 1)
+						having_cnd[query_id, having_id] = val
+					else
+						conds[query_id, where_id] = val
+				}
+				
+				if(pts[p] ~ /^ield[^"]*/){
+					val = pts[p]
+					val = strip_field(val)
+					gsub(/\//,"",val)
+					#print "Field is " val
+					fld = val
+				}
+				
+				if(pts[p] ~ /^able.*/){
+					split(pts[p],attVal,/=/)
+					val = strip_field(attVal[2])
+					#print "Table is " val
+					tbl = val "."
+				}
+				
+				if(pts[p] ~ /^ondition=*/){
+					#print "\t\t**CONDITIONAL " pts[p]
+					split(pts[p],attVal,/ondition=/)
+					val = strip_field(attVal[2])
+					
+					split(val,t,/ /)
+					# for(z=1;z<=length(t);z++){
+						# printf "\t\t***Part %d is %s\n", z, t[z]
+					# }
+					
+					if(t[1] ~ /^(between|in|is|like|<|>|&gt;=*|&lt;=*|&amp;gt;=*|&amp;lt;=*|=)/){
+						#print "\t\t" t[1]
+						cnd = val
+					}else{
+						cnd = "= " val
+					}
+					
+					#print val
+				}
+			}
+			#print "\t\t**WHERE IS:\t" tbl fld " " cnd
+			if(catch_have == 1)
+				having[query_id, having_id] = tbl fld " " cnd
+			else{
+				where_is_sub[query_id, where_id] = 0
+				wheres[query_id, where_id] = tbl fld " " cnd
+			}
+			tbl = ""
+			fld = ""
+			cnd = ""
+			
+		 }
+		 /^ *(<|&lt;)[Cc]onditional_[Gg]roup .*/{
+			split($0,pts,/([Cc]onditional_[Gg]roup|\") [FJ]/)
+			free_text = 0
+			
+			for(pt in pts){
+				if(pts[pt] ~ /F*reeText.*/){
+					free_text = 1
+					++where_id
+					val = strip_field(pts[pt])
+					gsub(/F*reeText=/,"",val)
+					where_is_sub[query_id, where_id] = 0
+					wheres[query_id, where_id] = val
+				}
+				
+				if(pts[pt] ~ /J*oin.*/){
+					val = strip_field(pts[pt])
+					gsub(/J*oin=/,"",val)
+					gsub(/\//,"",val)
+					val = toupper(val)
+					
+					if(free_text == 0 && val == "OR"){
+						grping = 1
+						tab_str = ""
+						++grp_lvl
+						++where_id
+						for(g=1;g<=grp_lvl;g++){
+							if(g > 1)
+								tab_str = tab_str "\t"
+						}
+						where_is_sub[query_id, where_id] = 0
+						wheres[query_id, where_id] = "\n" tab_str "("
+						first_in_grp = 1
+					}
+					
+					
+					if(first_in_grp == 1){
+						val = ""
+						first_in_grp = 0
+					}
+					conds[query_id, where_id] = toupper(val)
+				}
+			}
+		 }
+		 /^ *(<|&lt;)\/[Cc]onditional_[Gg]roup.*/{
+			if(grping == 1){
+				grping = 0
+				--grp_lvl
+				++where_id
+				where_is_sub[query_id, where_id] = 0
+				wheres[query_id, where_id] = tab_str ")"
+				conds[query_id, where_id] = ""
+			}
+		 }
+		 /^ *(<|&lt;)[Cc]onditional_[Ss]ub[Qq]uery .*/{
+			++where_id
+			mode = ""
+			nm = ""
+			split($0,pts,/(Conditional_SubQuery|\") /)
+			
+			for(pt in pts){
+				if(pts[pt] ~ /Join.*/){
+					split(pts[pt],attVal,/=/)
+					val = toupper(strip_field(attVal[2]))
+					if(first_in_grp == 1){
+						val = ""
+						first_in_grp = 0
+					}
+					conds[query_id, where_id]  = val
+				}
+				
+				if(pts[pt] ~ /Query_Name.*/){
+					split(pts[pt],attVal,/=/)
+					nm = strip_field(attVal[2])
+				}
+				
+				if(pts[pt] ~ /Mode.*/){
+					#split(pts[pt],attVal,/=/)
+					mode = strip_field(pts[pt])
+					gsub(/Mode=/,"",mode)
+					#print mode
+					if(mode ~ /(not )*exists/){
+						need_linked_field=0
+					}else{
+						need_linked_field=1
+					}
+				}
+			}
+		 }
+		 /^ *(<|&lt;)[Ll]ink.*/{
+			#print $0
+			fld = ""
+			tbl = ""
+			
+			if(need_linked_field == 1){
+				split($0,pts,/(Link|\") /)
+				
+				for(pt in pts){
+					if(pts[pt] ~ /Table_Field=\"[^\"]*/){
+						split(pts[pt],attVal,/=/)
+						fld = strip_field(attVal[2])
+						gsub(/\//,"",fld)
+						fld = fld " "
+					}
+					
+					if(pts[pt] ~ /Table=\"[^\"]*/){
+						split(pts[pt],attVal,/=/)
+						tbl = strip_field(attVal[2]) "."
+					}
+				}
+			}
+			
+			#print "Where is:\t" tbl fld mode " %%%" nm "%%%"
+			where_is_sub[query_id, where_id] = 1
+			wheres[query_id, where_id] = tbl fld toupper(mode) " %%%" nm "%%%"
+			mode = ""
+		 }
+		 /^ *(<|&lt;)orderby_field.*$/{
+			split($0, xml, /\"( |\/)/)
+			dir = ""
+			line = ""
+			for(x in xml){
+				attValPair = xml[x]
+				
+				gsub(/((<|&lt;)Field |\/&gt;|&#xD;)/,"",attValPair)
+
+				attr = attValPair
+				val = attValPair
+				
+				gsub(/\"[^\"]+/,"",attr)
+				gsub(/=/,"",attr)
+				gsub(/^[ \t]+/,"",attr)
+				gsub(/[ \t]+$/,"",attr)
+				
+				gsub(/[^\"]+=\"/,"",val)
+				gsub(/&amp;#xA;/,"\n",val)
+				gsub(/^[ \t]+/,"",val)
+				gsub(/[ \t]+$/,"",val)
+				
+				if(attr == "Field"){
+					line = line val
+				}
+				
+				if(attr == "Table"){
+					line = val "." line
+				}
+				
+				if(attr == "Sort"){
+					if(val == "Descending"){
+						dir = " DESC"
+					}
+				}
+				
+			}
+			
+			sort = line dir
+			++order_id
+			order_by[order_id] = sort
+		 }
+		 END{
+			col_cnts[query_id] = column_id
+			tab_cnts[query_id] = table_id
+			where_cnts[query_id] = where_id
+			group_cnts[query_id] = group_id
+			having_cnts[query_id] = having_id
+			
+			for(x=1;x<=last_query_id;x++){
+				max_col_len = 0
+				
+				for(z=1;z<col_cnts[x];z++){
+					if(columns[x,z] ~ /.*[\n\r].*/){
+						do_nothing = 1
+					}else{
+						if(length(columns[x,z]) > max_col_len)
+							max_col_len = length(columns[x,z])
+					}
+				}
+			
+				if(query_types[x] == "10")
+					print toupper(union_typ[x])
+				
+				if(query_types[x] == "01" || query_types[x] == "11")
+					add_tab="\t"
+				
+				if(query_types[x] == "00" || query_types[x] == "10"){
+					if(distinct[x] == 1)
+						print "SELECT DISTINCT"
+					else
+						print "SELECT"
+					
+					for(z=1;z<=col_cnts[x];z++){
+						comma = ","
+						if(z == col_cnts[x])
+							comma = " "
+						
+						split(columns[x,z],c,/\t####/)
+						
+						if(c[1] ~ /.*[\n\r].*/){
+							split(c[1],lines,/[\n\r]/)
+							last_line = lines[length(lines)]
+							len = (max_col_len - length(last_line)) + 1
+						}else{
+							len = max_col_len - length(c[1])
+						}
+						fill_str = " "
+						for(ll=1;ll<len;ll++)
+							fill_str = fill_str " "
+						printf "\t%s%s%s--%s\n", c[1], comma, fill_str, c[2]
+					}
+					
+					print "FROM"
+					for(z=1;z<=tab_cnts[x];z++){
+						comma = ","
+						if(z == tab_cnts[x])
+							comma = ""
+						printf "\t%s%s\n", tables[x,z], comma
+					}
+					
+					if(where_cnts[x] > 0){
+						printf "WHERE"
+						for(z=1;z<=where_cnts[x];z++){
+							a = "  " conds[x,z]
+							if(z == 1)
+								a = ""
+								
+							if(where_is_sub[x,z] == 1){
+								#print "sub_query_here"
+								idx = 0
+								
+								split(wheres[x,z],pts," ")
+								q_nm = pts[length(pts)]
+								where_line = wheres[x,z]
+								gsub(q_nm,"",where_line)
+								gsub(/%/,"",q_nm)
+								
+								for(y=1;y<=last_query_id;y++){
+									if(query_names[y] == q_nm){
+										idx = y
+										break
+									}
+								}
+								print a " " where_line
+								print "  ("
+								if(idx > 0){
+									if(distinct[idx] == 1){
+										print "\tSELECT DISTINCT"
+									}else{
+										print "\tSELECT"
+									}
+									
+									for(zz=1;zz<=col_cnts[idx];zz++){
+										comma = ","
+										if(zz == col_cnts[idx])
+											comma = " "
+										
+										split(columns[idx,zz],c,/\t####/)
+										len = max_col_len - length(c[1])
+										fill_str = " "
+										for(ll=1;ll<len;ll++)
+											fill_str = fill_str " "
+										printf "\t%s%s%s--%s\n", c[1], comma, fill_str, c[2]
+									}
+									
+									print "\tFROM"
+									for(zz=1;zz<=tab_cnts[idx];zz++){
+										comma = ","
+										if(zz == tab_cnts[idx])
+											comma = ""
+										printf "\t\t%s%s\n", tables[idx,zz], comma
+									}
+									
+									printf "\tWHERE"
+									for(zz=1;zz<=where_cnts[idx];zz++){
+										aa = "  " conds[idx,zz]
+										if(zz == 1)
+											aa = "" 
+										
+										printf "\t%s %s\n", aa, wheres[idx,zz]
+									}
+									
+									if(group_cnts[idx] > 0){
+										print "GROUP BY"
+										for(zz=1;zz<=group_cnts[idx];zz++){
+											comma = ","
+											if(z == group_cnts[idx])
+												comma = ""
+											printf "\t%s%s\n", groups[idx,zz], comma
+										}
+									}
+									
+									if(having_cnts[idx] > 0){
+										print "HAVING"
+										for(zz=1;zz<=having_cnts[idx];zz++){
+											a = ""
+											if(zz > 1)
+												a = having_cnd[idx,zz]
+											printf "\t%s %s\n", a, having[idx,zz]
+										}
+									}
+								}
+								print "  )"
+							}else
+								printf "%s %s\n", a, wheres[x,z]
+						}
+					}
+					
+					if(group_cnts[x] > 0){
+						print "GROUP BY"
+						for(z=1;z<=group_cnts[x];z++){
+							comma = ","
+							if(z == group_cnts[x])
+								comma = ""
+							printf "\t%s%s\n", groups[x,z], comma
+						}
+					}
+					
+					if(having_cnts[x] > 0){
+						print "HAVING"
+						for(z=1;z<=having_cnts[x];z++){
+							a = ""
+							if(z > 1)
+								a = having_cnd[x,z]
+							printf "\t%s %s\n", a, having[x,z]
+						}
+					}
+				}
+			}
+			
+			if(order_id > 0){
+				print "ORDER BY"
+				for(x=1;x<=order_id;x++){
+					comma = ","
+					if(x == order_id)
+						comma = ""
+					printf "\t%s%s\n", order_by[x], comma
+				}
+			}
+		 }' "${in_file}")
+fi
+
+#echo "${sql}"
+#exit
+
+echo "Getting individual reports"
+
+awk -v f_name="${in_file}" '
+	function strip_char(str){
+		gsub(/&#xD;/,"\n",str)
+		gsub(/&amp;lt;/,"<",str)
+		gsub(/&amp;gt;/,">",str)
+		gsub(/&amp;lt;&amp;gt;/,"<>",str)
+		gsub(/(<|&lt;)\/*Text(>|&gt;)/,"",str)
+		return str
+	}
+	function filler(str,min,  ret){
+		ret = ""
+		l = str
+		
+		len = length(l)
+		len = max_col_len - len - min
+		for(n=1;n<=len;n++)
+			ret = ret " "
+			
+		return ret
+	}
+	function last_index_of(str, chars, max_len,  indx){
+		indx = 1
+		
+		str1 = substr(str,0,max_len)
+		
+		for(dd=1;dd<=length(str1)+1-length(chars);dd++){
+			cur_chars = substr(str,dd,length(chars))
+			if(cur_chars == chars)
+				indx = dd
+		}
+
+		return indx
+	}
+	BEGIN{
+		catch_rpt=0
+		catch_desc=0
+		rpt_id=0
+		rpt_sql=""
+		rpt_nam=""
+		db_where_exists=0
+		db_order_exists=0
+		filter_act=0
+		filter=""
+		sort_act=0
+		sort=""
+		info_id = 0
+		desc_id = 0
+		vf_id = 0
+		skip_sched_info = 0
+		catch_dataset=0
+		dataset_id=0
+		dataset_line_id=0
+		catch_sql=0
+		catch_note=0
+		note_id=0
+		read_file=1
+		cur_file=""
+		
+		if(db_sql ~ /.*[^(]order by.*/)
+			db_order_exists=1
+		
+		if(db_sql ~ /.*--\$addfilter.*/)
+			db_where_exists=1
+	}
+	/^ *(<|&lt;)orderby_field.*$/{
+		if(read_file == 1)
+			db_order_exists=1
+	}
+	/^ *(<|&lt;)join.*(>|&gt;).*$/{
+		if(read_file == 1)
+			db_where_exists=1
+	}
+	/^ *<Report.*$/{
+		if(read_file == 1){
+			catch_rpt=1
+			split($0,attVal,/Report /)
+			rpt_nam = attVal[2]
+			gsub(/(Name=|\"|>|\r)/,"",rpt_nam)
+		}
+	}
+	/^ *<\/Report>.*$/{
+		if(read_file == 1){
+			catch_rpt=0
+			sort = substr(sort,0,length(sort)-2)
+			++rpt_id
+			rpt_nams[rpt_id] = rpt_nam
+			filters[rpt_id] = filter
+			sorts[rpt_id] = sort
+			info_cnt[rpt_id] = info_id
+			vf_cnt[rpt_id] = vf_id
+			desc_cnt[rpt_id] = desc_id
+			dataset_cnt[rpt_id] = dataset_id
+			note_cnt[rpt_id] = note_id
+			rpt_sql = ""
+			rpt_nam = ""
+			filter = ""
+			sort = ""
+			info_id = 0
+			vf_id = 0
+			desc_id = 0
+			skip_sched_info = 0
+			dataset_id = 0
+			dataset_line_id = 0
+			note_id = 0
+		}
+	}
+	/^ *(<|&lt;)Author.*$/{
+		if(catch_rpt == 1 && skip_sched_info == 0 && catch_note == 0 && read_file == 1){
+			val=$0
+			gsub(/(<|&lt;)\/*Author(>|&gt;)/,"",val)
+			gsub(/^[ \t]*|[ \t]*$/,"",val)
+			gsub(/(\n|\r)/,"",val)
+			++info_id
+			info[rpt_id + 1,info_id] = "Author:         " val
+		}
+	}
+	/^ *(<|&lt;)Create_Date.*$/{
+		if(catch_rpt == 1 && skip_sched_info == 0 && read_file == 1){
+			val=$0
+			gsub(/(<|&lt;)\/*Create_Date(>|&gt;)/,"",val)
+			gsub(/^[ \t]*|[ \t]*$/,"",val)
+			gsub(/(\n|\r)/,"",val)
+			++info_id
+			info[rpt_id + 1,info_id] = "Created:        " val
+		}
+	}
+	/^ *(<|&lt;)Modify_Date.*$/{
+		if(catch_rpt == 1 && skip_sched_info == 0 && read_file == 1){
+			val=$0
+			gsub(/(<|&lt;)\/*Modify_Date(>|&gt;)/,"",val)
+			gsub(/^[ \t]*|[ \t]*$/,"",val)
+			gsub(/(\n|\r)/,"",val)
+			++info_id
+			info[rpt_id + 1,info_id] = "Modified:       " val
+		}
+	}
+	/^ *(<|&lt;)Type.*$/{
+		if(catch_rpt == 1 && skip_sched_info == 0 && read_file == 1){
+			val=$0
+			gsub(/(<|&lt;)\/*Type(>|&gt;)/,"",val)
+			gsub(/^[ \t]*|[ \t]*$/,"",val)
+			gsub(/(\n|\r)/,"",val)
+			++info_id
+			info[rpt_id + 1,info_id] = "Type:           " val
+		}
+	}
+	/^ *(<|&lt;)Scheduled.*$/{
+		if(read_file == 1)
+			skip_sched_info = 1
+	}
+	/^ *(<|&lt;)Filter Active=\"Yes\"(>|&gt;).*$/{
+		if(read_file == 1)
+			filter_act = 1
+		next
+	}
+	/^ *(<|&lt;)\/Filter(>|&gt;).*$/{
+		if(read_file == 1)
+			filter_act = 0
+	}
+	/^ *(<|&lt;)Sort Active=\"Yes\"(>|&gt;).*$/{
+		if(read_file == 1)
+			sort_act = 1
+	}
+	/^ *(<|&lt;)\/Sort(>|&gt;).*$/{
+		if(read_file == 1)
+			sort_act = 0
+	}
+	/^ *(<|&lt;)Field .*$/{
+		if(read_file == 1){
+			if(catch_rpt == 1 && sort_act == 1){
+				split($0, xml, /(Field|\") [ND]/)
+				dir = ""
+				for(x in xml){
+					attValPair = xml[x]
+					
+					gsub(/((<|&lt;)F*ield |\/&gt;|&#xD;)/,"",attValPair)
+
+					attr = attValPair
+					val = attValPair
+					
+					gsub(/\"[^\"]+/,"",attr)
+					gsub(/=/,"",attr)
+					gsub(/^[ \t]+/,"",attr)
+					gsub(/[ \t]+$/,"",attr)
+					
+					gsub(/[^\"]+=\"/,"",val)
+					gsub(/^[ \t]+/,"",val)
+					gsub(/[ \t]+$/,"",val)
+					gsub(/&amp;lt;/,"<",val)
+					gsub(/&amp;gt;/,">",val)
+					gsub(/&amp;#xA;/,"\n\t",val)
+					
+					if(attr ~ /N*ame.*/){
+						line = "\t" val
+					}
+					
+					if(attr ~ /D*irection.*/){
+						if(val == "Descending"){
+							dir = " DESC"
+						}
+					}
+					
+				}
+				
+				sort = sort line dir ",\n"
+				line = ""
+			}else if(catch_rpt == 1 && skip_sched_info == 0){
+				split($0,pts,/(Field|\") [CFTNWVEM]/)
+				
+				for(pt in pts){
+					if(pts[pt] ~ /^C*olumnName.*/){
+						val = pts[pt]
+						gsub(/C*olumnName=\"/,"",val)
+						++vf_id
+						vflds[rpt_id + 1,vf_id] = val
+					}
+					
+					if(pts[pt] ~ /^V*alue.*/){
+						val = pts[pt]
+						gsub(/V*alue=\"/,"",val)
+						gsub(/\"\/&gt;&#xD;/,"",val)
+						
+						if(val != ""){
+							++vf_id
+							vflds[rpt_id + 1,vf_id] = val
+						}
+					}
+					
+					if(pts[pt] ~ /^E*xpression.*/){
+						val = pts[pt]
+						gsub(/E*xpression=\"/,"",val)
+						gsub(/\"\/&gt;&#xD;/,"",val)
+						gsub(/&amp;lt;/,"<",val)
+						gsub(/&amp;gt;/,">",val)
+						++vf_id
+						vflds[rpt_id + 1,vf_id] = val
+					}
+					
+					if(pts[pt] ~ /^F*ield.*/){
+						val = pts[pt]
+						gsub(/(F*ield=\"|\"\/&gt;&#xD;)/,"",val)
+						++vf_id
+						vflds[rpt_id + 1,vf_id] = val
+					}
+				}
+			}
+		}
+	}
+	/^ *(<|&lt;)Description(>|&gt;).*$/{
+		if(catch_rpt == 1 && catch_desc == 0 && read_file == 1){
+			catch_desc = 1
+			line = $0
+			gsub(/\n|\r/,"",line)
+			gsub(/(<|&lt;)Description(>|&gt;)/,"",line)
+			gsub(/^[ \t]*|[ \t]*$/,"",line)
+			gsub(/[\*\/]*/,"",line)
+			gsub(/&#xD;/,"",line)
+			++desc_id
+			desc[rpt_id + 1, desc_id] = line
+		}
+		next
+	}
+	/^.*(<|&lt;)\/Description(>|&gt;)[\n\r]*$/{
+		if(catch_rpt == 1 && catch_desc == 1 && read_file == 1){
+			catch_desc = 0
+			line = $0
+			gsub(/\n|\r/,"",line)
+			gsub(/(<|&lt;)\/Description(>|&gt;)/,"",line)
+			gsub(/^[ \t]*|[ \t]*$/,"",line)
+			gsub(/[\*\/]*/,"",line)
+			++desc_id
+			desc[rpt_id + 1, desc_id] = line
+		}
+		next
+	}
+	/^ *(<|&lt;)DataSet .*$/{
+		if(catch_dataset == 0 && catch_rpt == 1 && read_file == 1){
+			catch_dataset = 1
+			
+			split($0,pts,/(DataSet|\") [NM]/)
+			
+			for(pt in pts){
+				if(pts[pt] ~ /^N*ame.*/){
+					val = pts[pt]
+					gsub(/N*ame=\"|\"|\/|&gt;&#xD;/,"",val)
+					++dataset_id
+					dataset_names[rpt_id + 1,dataset_id] = val
+				}
+			}
+		}
+	}
+	/^ *(<|&lt;)\/DataSet(>|&gt;)/{
+		if(catch_dataset == 1 && catch_rpt == 1 && read_file == 1){
+			catch_dataset = 0
+			dataset_line_cnt[rpt_id + 1,dataset_id] = dataset_line_id
+			dataset_line_id = 0
+		}
+	}
+	/^.*(<|&lt;)\/*Sql.*/{
+		if(catch_dataset == 1 && catch_rpt == 1 && read_file == 1){
+			if(catch_sql == 0)
+				catch_sql = 1
+			else
+				catch_sql = 0
+				
+			val = $0
+			gsub(/(&lt;\/*Sql&gt;|&#xD;)/,"",val)
+			gsub(/(&amp;lt;|&lt;)/,"<",val)
+			gsub(/(&amp;gt;|&gt;)/,">",val)
+			++dataset_line_id
+			dataset_lines[rpt_id + 1,dataset_id,dataset_line_id] = val
+		}
+		next
+	}
+	/^ *(<|&lt;)Note.*/{
+		if(catch_rpt == 1 && read_file == 1){
+			if(catch_note == 0){
+				catch_note = 1
+				
+				val = $0
+				gsub(/(<|&lt;)Note Title=|\"|>|&gt;|\r/,"",val)
+				gsub(/^[ \t]*|[ \t]*$/,"",val)
+				
+				++note_id
+				note_title[rpt_id + 1,note_id] = val
+			}
+		}
+	}
+	/^ *(<|&lt;)\/Note.*/{
+		catch_note = 0
+	}
+	/^ *(<|&lt;)Text.*/{
+		if(catch_rpt == 1 && catch_note == 1 && read_file == 1){
+			val = $0
+			gsub(/(<|&lt;)\/*Text(>|&gt;)/,"",val)
+			gsub(/\r/,"",val)
+			gsub(/&#xD;/,"",val)
+			gsub(/^[ \t]*|[ \t]*$/,"",val)
+			
+			note_txt[rpt_id + 1,note_id] = val
+			catch_note = 0
+		}
+	}
+	/.*/{
+		if(FILENAME != cur_file){
+			if(FILENAME != f_name)
+				read_file = 0
+			else
+				read_file = 1
+				
+			cur_file = FILENAME
+		}
+		if(read_file == 1){
+			if(catch_rpt == 1 && filter_act == 1){
+				line = $0
+				filter = filter strip_char(line)
+			}
+			
+			if(catch_rpt == 1 && catch_desc == 1 && skip_sched_info == 0){
+				line = $0
+				gsub(/\n|\r/,"",line)
+				gsub(/^[ \t]*|[ \t]*$/,"",line)
+				gsub(/[\*\/]*/,"",line)
+				gsub(/&#xD;/,"",line)
+				++desc_id
+				desc[rpt_id + 1, desc_id] = line
+			}
+			
+			if(catch_rpt == 1 && catch_dataset == 1 && catch_sql == 1){
+				val = $0
+				gsub(/&#xD;/,"",val)
+				gsub(/(&amp;lt;|&lt;)/,"<",val)
+				gsub(/(&amp;gt;|&gt;)/,">",val)
+				++dataset_line_id
+				dataset_lines[rpt_id + 1,dataset_id,dataset_line_id] = val
+			}
+			
+			if(catch_rpt == 1 && catch_note == 1 && skip_sched_info == 0){
+				val = $0
+				gsub(/(<|&lt;)\/*Text(>|&gt;)/,"",val)
+				gsub(/\r/,"",val)
+				gsub(/&#xD;/,"",val)
+				gsub(/^[ \t]*|[ \t]*$/,"",val)
+				
+				note_txt[rpt_id + 1,note_id] = note_txt[rpt_id + 1,note_id] "\n" val
+			}
+		}else{
+			db_sql = db_sql "\n" $0
+			if($0 ~ /.*--\$addfilter$/)
+				db_where_exists = 1
+		}
+	}
+	END{
+		if(read_file == 1){
+			for(x=1;x<=rpt_id;x++){
+				max_col_len = 0
+					
+				for(z=1;z<info_cnt[x];z++){
+					if(length(info[x,z])+4 > max_col_len)
+						max_col_len = length(info[x,z])
+				}
+				for(z=1;z<desc_cnt[x];z++){
+					if(length(desc[x,z])+8 > max_col_len)
+						max_col_len = length(desc[x,z])
+				}
+				for(z=1;z<vf_cnt[x];z++){
+					if(length(vflds[x,z]) > max_col_len)
+						max_col_len = length(vflds[x,z])
+				}
+				
+				max_col_len = max_col_len + 1
+				
+				spacer = ""
+				for(n=1;n<=max_col_len;n++)
+					spacer = spacer " "
+				
+				printf "/* --%s-- */\n", rpt_nams[x]
+				
+				if(info_cnt[x] > 0){
+					printf "/*%s*/\n", spacer
+					
+					for(z=1;z<=info_cnt[x];z++){
+						fill_str = filler(info[x,z],4)
+						
+						printf "/*    %s%s*/\n", info[x,z], fill_str
+					}
+				}
+				
+				if(desc_cnt[x] > 0){
+					printf "/*%s*/\n", spacer
+					
+					heading = "/*    Description"
+					fill_str = filler(heading,-2)
+					printf "%s%s*/\n",heading,fill_str
+					
+					for(z=1;z<=desc_cnt[x];z++){
+						if(length(desc[x,z])+8 <= max_col_len){
+							fill_str = filler(desc[x,z],8)
+							printf "/*        %s%s*/\n", desc[x,z], fill_str
+						}else{
+							li = 0
+							li = last_index_of(desc[x,z]," ",max_col_len-8)
+							
+							p1 = substr(desc[x,z],1,li)
+							p2 = substr(desc[x,z],li)
+							
+							fill_str = filler(p1,8)
+							printf "/*        %s%s*/\n",p1,fill_str
+							fill_str = filler(p2,12)
+							printf "/*            %s%s*/\n",p2,fill_str
+						}
+					}
+				}
+				
+				if(note_cnt[x] > 0){
+					printf "/*%s*/\n", spacer
+					heading = "/*    Argos Notes:"
+					fill_str = filler(heading,-2)
+					printf "%s%s*/\n",heading,fill_str
+					
+					for(z=1;z<=note_cnt[x];z++){
+						if(length(note_title[x,z])+8 <= max_col_len){
+							fill_str = filler(note_title[x,z],8)
+							printf "/*        %s%s*/\n", note_title[x,z], fill_str
+						}else{
+							li = 0
+							li = last_index_of(note_title[x,z]," ",max_col_len-8)
+							
+							p1 = substr(note_title[x,z],1,li)
+							p2 = substr(note_title[x,z],li)
+							
+							fill_str = filler(p1,8)
+							printf "/*        %s%s*/\n",p1,fill_str
+							fill_str = filler(p2,12)
+							printf "/*            %s%s*/\n",p2,fill_str
+						}
+						
+						if(length(note_txt[x,z])+8 <= max_col_len){
+							fill_str = filler(note_txt[x,z],8)
+							printf "/*        %s%s*/\n", note_txt[x,z], fill_str
+						}else{
+							li = 0
+							li = last_index_of(note_txt[x,z]," ",max_col_len-8)
+							
+							p1 = substr(note_txt[x,z],1,li)
+							p2 = substr(note_txt[x,z],li)
+							
+							fill_str = filler(p1,8)
+							printf "/*        %s%s*/\n",p1,fill_str
+							fill_str = filler(p2,12)
+							printf "/*            %s%s*/\n",p2,fill_str
+						}
+					}
+				}
+				
+				if(vf_cnt[x] > 0){
+					printf "/*%s*/\n", spacer
+					heading = "/*    Visible Fields:"
+					fill_str = filler(heading,-2)
+					printf "%s%s*/\n",heading,fill_str
+					
+					for(z=1;z<=vf_cnt[x];z++){
+						fill_str = filler(vflds[x,z],10)
+						printf "/*        --%s%s*/\n", vflds[x,z], fill_str
+					}
+				}
+				
+				if(dataset_cnt[x] > 0){
+					printf "/*%s*/\n", spacer
+					heading = "/*    Sub-Datasets:"
+					fill_str = filler(heading,-2)
+					printf "%s%s*/\n",heading,fill_str
+					
+					for(z=1;z<=dataset_cnt[x];z++){
+						fill_str = filler(dataset_names[x,z],10)
+						printf "/*        --%s%s*/\n", dataset_names[x,z], fill_str
+					}
+				}
+				
+				print "\n"
+				
+				#print db_sql
+				
+				if(db_order_exists == 1){
+					IGNORECASE = 1
+					split(db_sql, sql, /.*[^(]order by.*/)
+					
+					if(filters[x] != "" && sorts[x] != ""){
+						if(db_where_exists == 1){
+							print sql[0] "and " filters[x] sql[1] ",\n" sorts[x]
+						}else{
+							print "WHERE " filters[x] sql[1] ",\n" sorts[x]
+						}
+					}else if(filters[x] != ""){
+						if(db_where_exists == 1){
+							print sql[0] "and " filters[x] sql[1]
+						}else{
+							print sql[0] "WHERE " filters[x] sql[1]
+						}
+					}else if(sorts[x] != ""){
+						print db_sql ",\n" sorts[x]
+					}else{
+						print db_sql
+					}
+				}else{
+					print db_sql
+					if(filters[x] != ""){
+						if(db_where_exists == 1)
+							print "and " filters[x]
+						else
+							print "WHERE " filters[x]
+					}
+					
+					if(sorts[x] != "")
+						print "ORDER BY\n" sorts[x]
+				}
+				
+				if(dataset_cnt[x] > 0){
+					print "\n\n"
+					
+					for(z=1;z<=dataset_cnt[x];z++){
+						printf "/* %s */\n\n", dataset_names[x,z]
+						
+						for(n=1;n<=dataset_line_cnt[x,z];n++){
+							print dataset_lines[x,z,n]
+						}
+						
+						if(z < dataset_cnt[x])
+							print "\n\n"
+					}
+				}
+			}
+		}
+	}
+	' <(echo "$sql") "${in_file}" > "${in_file}.sql"
+
+echo "Splitting individual files"
+
+csplit --silent --digits=003 --quiet --prefix=.output -z "${in_file}.sql" "/\/\* --.*-- \*\//" "{*}"
+	
+for ff in .output*
+do
+	rpt_name=$(head -n 1 $ff)
+	rpt_name=${rpt_name//\*}
+	rpt_name=${rpt_name//\/}
+	rpt_name=${rpt_name// --/}
+	rpt_name=${rpt_name//-- /}
+	
+	mv $ff "$rpt_name".argos.sql
+done
+
+rm "${in_file}.sql"
+
+echo "Process complete"
